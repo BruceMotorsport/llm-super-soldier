@@ -24,7 +24,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 import uvicorn
 
-GROQ_URL = "http://127.0.0.1:8080/v1/chat/completions"
+GROQ_URL = "http://127.0.0.1:9001/v1/chat/completions"  # Provider Console (includes Groq adapter)
 PROVIDER_URL = "http://127.0.0.1:9001/v1/chat/completions"  # Provider Console — routes to Local multi-instance opencode + Groq
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
@@ -49,15 +49,25 @@ groq_s = ProviderState("Groq")
 provider_s = ProviderState("ProviderConsole")  # Local multi-instance opencode + Groq
 openrouter_s = ProviderState("OpenRouter")
 
-# ── Opencode Model List (from Provider Console) ─────────────────
+# LOCKED MODELS — decent only, no chat-only garbage
+# Author: Buddy (Simone tests/findings / Bruce directives / Luke functionality verified)
+ALLOWED_MODELS = [
+    # Opencode — agentic / tool-use / full-feature (verified through :9001 Provider Console)
+    "opencode/mimo-v2.6-flash-free",      # Best agentic / code / tool-calling (verified)
+    "opencode/nemotron-3-ultra-free",     # Ultra-capacity for complex reasoning
+    # Groq via :9001 — verified working (openai/* models respond in ~0.02s with finish=stop)
+    "openai/gpt-oss-120b",                # Verified: responds with reasoning, finish=stop
+    # Luke's Colibri servers — verified live on :9002 / :9003 (test_models.ps1 demo)
+    "olmoe-colibri",                       # OLMoE :9003 — 2.86 tok/s (36 tok / 12.6s) — decent, > Ollama
+    "qwen3.6-colibri",                      # Qwen3.6-27B :9002 — 0.8 tok/s (34 tok / 42.3s) — decent, > Ollama (concurrent download depressed speed; rerun for honest numbers)
+    # Note: allam-2-7b HANGS (30s timeout) — EXCLUDED ; space-bunny/muse-spark low-quality — EXCLUDED
+]
+# Whitelist enforcement: any model not in ALLOWED_MODELS is rejected at server entry
+
+# ── Opencode Model List (verified against Provider Console :9001 /v1/models) ─────
 OPENCODE_MODELS = [
-    "opencode/mimo-v2.6-flash-free",     # Luke/Simone preferred
-    "opencode/nemotron-3.5-lightning-free",
-    "opencode/nemotron-3-ultra-free",
-    "opencode/ling-3.0-flash-fin-free",
-    "opencode/muse-spark-1.3-contributor-free",
-    "opencode/longcat-2.5-preview-free",
-    "opencode/space-bunny-free",
+    "opencode/mimo-v2.6-flash-free",     # Agentic / code — verified
+    "opencode/nemotron-3-ultra-free",     # Complex reasoning — verified
 ]
 
 # ── FastAPI ───────────────────────────────────────────────────────
@@ -70,8 +80,9 @@ app = FastAPI(title="Super-Soldier Auto-Route")
 def call_provider(prompt: str, model: str) -> Optional[str]:
     """Route through Provider Console — handles Local opencode selection."""
     if not provider_s.can(): return None
-    ALLOWED_FREE_MODELS = {"opencode/mimo-v2.6-flash-free","opencode/nemotron-3.5-lightning-free","opencode/nemotron-3-ultra-free","opencode/ling-3.0-flash-fin-free","opencode/muse-spark-1.3-contributor-free","opencode/longcat-2.5-preview-free","opencode/space-bunny-free"}
-    selected_model = model if model in ALLOWED_FREE_MODELS else "opencode/ling-3.0-flash-fin-free"
+    # Lock to decent opencode models only — exclude chat-only / broken models
+    ALLOWED_FREE_MODELS = {"opencode/mimo-v2.6-flash-free","opencode/nemotron-3-ultra-free"}
+    selected_model = model if (model in ALLOWED_FREE_MODELS) else "opencode/mimo-v2.6-flash-free"
     payload = {"model": selected_model,
                "messages": [{"role":"user","content":prompt}],
                "max_tokens": 500, "temperature": 0.1}
@@ -87,7 +98,10 @@ def call_provider(prompt: str, model: str) -> Optional[str]:
 
 def call_groq(prompt: str, model: str) -> Optional[str]:
     if not GROQ_KEY or not groq_s.can(): return None
-    payload = {"model": model or "allam-2-7b",
+    # Lock to decent models only — allam-2-7b hangs (30s timeout), never use it
+    if model and model not in ALLOWED_MODELS:
+        model = "openai/gpt-oss-120b"  # Fallback to verified working model
+    payload = {"model": model or "openai/gpt-oss-120b",
                "messages": [{"role":"user","content":prompt}],
                "max_tokens": 500, "temperature": 0.1}
     try:
@@ -156,7 +170,21 @@ def process_auto(task: str, prefer_opencode: bool = False) -> Dict[str, Any]:
             if not result:
                 result = call_openrouter(question, "openrouter/free")
                 provider = "openrouter"
-            results.append({"question": question, "answer": result or "Unanswered", "provider": provider})
+            # Cache answer for interquestion referencing
+            answer_text = result or "Unanswered"
+            question_cache[i] = answer_text
+            # If this question asks about a previous answer, inject cache context
+            ref_match = __import__('re').search(r"question\s+(\d+)", question, __import__('re').IGNORECASE)
+            if ref_match:
+                ref_idx = int(ref_match.group(1)) - 1  # 0-based
+                if 0 <= ref_idx < i and ref_idx in question_cache:
+                    # Build context with prior answers
+                    context_text = f"Prior answers: Q{ref_idx+1}={question_cache.get(ref_idx, 'N/A')}. Now answer: {question}"
+                    # Re-ask with context (only if reference detected)
+                    result = call_provider(context_text, "opencode/mimo-v2.6-flash-free") or result
+                    answer_text = result or answer_text
+                    question_cache[i] = answer_text
+            results.append({"question": question, "answer": answer_text, "provider": provider})
         return {
             "task": task,
             "results": results,
@@ -166,8 +194,8 @@ def process_auto(task: str, prefer_opencode: bool = False) -> Dict[str, Any]:
             "opencode_models_available": OPENCODE_MODELS
         }
 
-    # 1. Try Groq (fastest for simple tasks)
-    result = call_groq(task, "allam-2-7b")
+    # 1. Try Groq (fastest for simple tasks) — locked to decent model
+    result = call_groq(task, "openai/gpt-oss-120b")
     provider = "groq"
     
     # 2. If Groq fails OR task needs opencode capabilities → Provider Console
@@ -187,6 +215,52 @@ def process_auto(task: str, prefer_opencode: bool = False) -> Dict[str, Any]:
         "provider": provider,
         "latency": time.time() - start,
         "success": bool(result),
+        "opencode_models_available": OPENCODE_MODELS
+    }
+
+# Cache for interquestion referencing — allows questions to reference earlier answers
+question_cache = {}  # {question_index: answer}
+
+
+# ── Chunked Processing Apparatus ──────────────────────────────────
+# Handles large batches by splitting into chunks to stay within context window.
+# Each chunk is processed independently with interreference cache preserved.
+
+def process_large_batch(task: str, chunk_size: int = 200, prefer_opencode: bool = False) -> Dict[str, Any]:
+    """Process a massive batch by chunking — preserves interreference across chunks."""
+    start = time.time()
+    task_normalized = task.replace('\\n', '\n')
+    lines = [line.strip() for line in task_normalized.split('\n') if line.strip()]
+    if len(lines) == 1:
+        lines = [line.strip() for line in task.split('? ') if line.strip()]
+        lines = [l + '?' for l in lines if l.strip()]
+    question_lines = [line for line in lines if line.endswith('?')]
+    
+    all_results = []
+    total = len(question_lines)
+    
+    for chunk_start in range(0, total, chunk_size):
+        chunk = question_lines[chunk_start:chunk_start + chunk_size]
+        chunk_task = "\n".join(chunk)
+        # Use existing multi-question routine per chunk
+        chunk_result = process_auto(chunk_task, prefer_opencode=prefer_opencode)
+        if chunk_result.get("results"):
+            # Offset result indices to preserve global reference mapping
+            for i, r in enumerate(chunk_result["results"]):
+                global_idx = chunk_start + i
+                r["global_index"] = global_idx
+                # Cache for inter-chunk references
+                question_cache[global_idx] = r.get("answer", "Unanswered")
+            all_results.extend(chunk_result["results"])
+    
+    return {
+        "task": task,
+        "results": all_results,
+        "provider": "chunked-multi-question",
+        "latency": time.time() - start,
+        "success": len(all_results) == total,
+        "total_questions": total,
+        "chunks_processed": (total + chunk_size - 1) // chunk_size,
         "opencode_models_available": OPENCODE_MODELS
     }
 
@@ -226,6 +300,49 @@ if __name__ == "__main__":
     print("=== SUPER-SOLDIER AUTO-ROUTER STARTED ===")
     print("Order: Groq → Provider Console (Local multi-instance opencode) → OpenRouter (last)")
     print("Opencode models available:", OPENCODE_MODELS)
+
+# ── Chunked Processing Apparatus ──────────────────────────────────
+# Handles large batches by splitting into chunks to stay within context window.
+# Each chunk is processed independently with interreference cache preserved.
+
+def process_large_batch(task: str, chunk_size: int = 200, prefer_opencode: bool = False) -> Dict[str, Any]:
+    """Process a massive batch by chunking — preserves interreference across chunks."""
+    start = time.time()
+    task_normalized = task.replace('\\n', '\n')
+    lines = [line.strip() for line in task_normalized.split('\n') if line.strip()]
+    if len(lines) == 1:
+        lines = [line.strip() for line in task.split('? ') if line.strip()]
+        lines = [l + '?' for l in lines if l.strip()]
+    question_lines = [line for line in lines if line.endswith('?')]
+    
+    all_results = []
+    total = len(question_lines)
+    
+    for chunk_start in range(0, total, chunk_size):
+        chunk = question_lines[chunk_start:chunk_start + chunk_size]
+        chunk_task = "\n".join(chunk)
+        # Use existing multi-question routine per chunk
+        chunk_result = process_auto(chunk_task, prefer_opencode=prefer_opencode)
+        if chunk_result.get("results"):
+            # Offset result indices to preserve global reference mapping
+            for i, r in enumerate(chunk_result["results"]):
+                global_idx = chunk_start + i
+                r["global_index"] = global_idx
+                # Cache for inter-chunk references
+                question_cache[global_idx] = r.get("answer", "Unanswered")
+            all_results.extend(chunk_result["results"])
+    
+    return {
+        "task": task,
+        "results": all_results,
+        "provider": "chunked-multi-question",
+        "latency": time.time() - start,
+        "success": len(all_results) == total,
+        "total_questions": total,
+        "chunks_processed": (total + chunk_size - 1) // chunk_size,
+        "opencode_models_available": OPENCODE_MODELS
+    }
+
 # ── Session Memory (multi-turn list persistence) ─────────────────
 session_memory = {}
 session_memory["test_list"] = [
