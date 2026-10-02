@@ -1,4 +1,10 @@
 # ── Load Lazarus Vault (durable identity + rules) ─────────────────────────
+import sys as _sys
+try:
+    _sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    _sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
 VAULT_PATH = r"C:\\Users\\Bruce\\Lazarus\\buddy2-Lazarus\\memories\\MEMORY.md"
 VAULT_MEMORY = {}
 try:
@@ -6,9 +12,23 @@ try:
 except: VAULT_MEMORY["content"] = ""
 
 # --- Autonomous session DB (thousands of items, cross-turn) ---
-import sqlite3
-DB_PATH = r'C:\Users\Bruce\llm-super-soldier-tests.db'
-SESSION_DB = sqlite3.connect(DB_PATH)
+import sqlite3, os as _os
+_DB_CANDIDATES = [
+    r'C:\Users\Bruce\llm-super-soldier-tests.db',
+    _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), 'llm-super-soldier-tests.db'),
+]
+SESSION_DB = None
+for _p in _DB_CANDIDATES:
+    try:
+        _dir = _os.path.dirname(_p)
+        if _dir and not _os.path.isdir(_dir):
+            continue
+        SESSION_DB = sqlite3.connect(_p)
+        break
+    except sqlite3.OperationalError:
+        continue
+if SESSION_DB is None:
+    SESSION_DB = sqlite3.connect(_os.path.join(_os.path.dirname(_os.path.abspath(__file__)), 'llm-super-soldier-tests.db'))
 SESSION_CURSOR = SESSION_DB.cursor()
 
 # Vault identity + rules persist across agent restarts/replacements
@@ -243,7 +263,7 @@ def pick_opencode_model(task: str) -> str:
     if any(k in t for k in ["code","function","program","python"]):
         return "opencode/mimo-v2.6-flash-free"  # Agentic/tool-calling best
     if any(k in t for k in ["summarize","summary","short"]):
-        return "opencode/"opencode/nemotron-3-ultra-free""  # Fast
+        return "opencode/nemotron-3-ultra-free"  # Fast
     return "opencode/mimo-v2.6-flash-free"  # Default for Luke/Simone
 
 # ── Full Auto-Route (no manual selection needed) ─────────────────
