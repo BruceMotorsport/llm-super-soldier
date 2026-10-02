@@ -57,10 +57,7 @@ ALLOWED_MODELS = [
     "opencode/nemotron-3-ultra-free",     # Ultra-capacity for complex reasoning
     # Groq via :9001 — verified working (openai/* models respond in ~0.02s with finish=stop)
     "openai/gpt-oss-120b",                # Verified: responds with reasoning, finish=stop
-    # Luke's Colibri servers — verified live on :9002 / :9003 (test_models.ps1 demo)
-    "olmoe-colibri",                       # OLMoE :9003 — 2.86 tok/s (36 tok / 12.6s) — decent, > Ollama
-    "qwen3.6-colibri",                      # Qwen3.6-27B :9002 — 0.8 tok/s (34 tok / 42.3s) — decent, > Ollama (concurrent download depressed speed; rerun for honest numbers)
-    # Note: allam-2-7b HANGS (30s timeout) — EXCLUDED ; space-bunny/muse-spark low-quality — EXCLUDED
+    # Note: allam-2-7b HANGS (30s timeout) — EXCLUDED; space-bunny/muse-spark low-quality — EXCLUDED
 ]
 # Whitelist enforcement: any model not in ALLOWED_MODELS is rejected at server entry
 
