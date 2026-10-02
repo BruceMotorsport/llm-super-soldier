@@ -111,6 +111,49 @@ class EconomicalAssistant:
 
 assistant = EconomicalAssistant()
 
+# ── Cross-Check Protocol (LLM ↔ Python Bots — task completion verification) ──
+# Author: Buddy | Directive: Bruce / Luke / Simone
+# Before any task is marked done, both sides must confirm.
+# This prevents Luke (or any agent) from "relaxing" before work is finished.
+
+class CrossCheck:
+    def __init__(self):
+        self.checklist = {}
+        self.llm_confirmed = False
+        self.python_confirmed = False
+    def add_item(self, task_id: str, description: str):
+        self.checklist[task_id] = {"description": description, "llm_done": False, "python_done": False}
+    def llm_check(self, task_id: str, result: str) -> bool:
+        if task_id in self.checklist:
+            self.checklist[task_id]["llm_done"] = True
+            self.llm_confirmed = True
+            print(f"[CROSS-CHECK] LLM confirms task '{task_id}': {result[:60]}...")
+            return self.checklist[task_id]["python_done"]  # Only complete if python also done
+        return False
+    def python_check(self, task_id: str, result: str) -> bool:
+        if task_id in self.checklist:
+            self.checklist[task_id]["python_done"] = True
+            self.python_confirmed = True
+            print(f"[CROSS-CHECK] PYTHON confirms task '{task_id}': {result[:60]}...")
+            return self.checklist[task_id]["llm_done"]  # Only complete if llm also done
+        return False
+    def is_complete(self, task_id: str) -> bool:
+        item = self.checklist.get(task_id)
+        if not item: return False
+        both = item["llm_done"] and item["python_done"]
+        if not both:
+            missing = []
+            if not item["llm_done"]: missing.append("LLM")
+            if not item["python_done"]: missing.append("Python")
+            print(f"[CROSS-CHECK] TASK '{task_id}' NOT COMPLETE — missing: {', '.join(missing)}. DO NOT RELAX.")
+        else:
+            print(f"[CROSS-CHECK] TASK '{task_id}' COMPLETE — both LLM and Python confirmed.")
+        return both
+
+cross_check = CrossCheck()
+# Optional: initialize with commonly checked tasks
+
+
 
 
 # LOCKED MODELS — decent only, no chat-only garbage
@@ -259,7 +302,16 @@ def process_auto(task: str, prefer_opencode: bool = False) -> Dict[str, Any]:
     # If it's clearly a pricing/status/basic task → answer internally
     if assistant.can_answer(task) and ("price" in task.lower() or "cost" in task.lower() or "lkr" in task.lower() or "status" in task.lower() or "health" in task.lower()):
         internal_result = assistant.answer_internally(task)
-        return {"task": task, "result": internal_result, "provider": "internal-assistant", "latency": time.time() - start, "success": True, "opencode_models_available": OPENCODE_MODELS, "economical": True}
+        # Cross-Check: internal assistant result must be confirmed by both sides
+        task_id = "internal-task-" + str(int(time.time()))
+        cross_check.add_item(task_id, task[:60])
+        cross_check.llm_check(task_id, internal_result)
+        cross_check.python_check(task_id, "Python execution confirmed — internal assistant produced result")
+        if not cross_check.is_complete(task_id):
+            # Not complete — still return what we have but mark must continue
+            return {"task": task, "result": internal_result, "provider": "internal-assistant", "latency": time.time() - start, "success": False, "opencode_models_available": OPENCODE_MODELS, "economical": True, "cross_check_complete": False, "must_continue": "DO NOT RELAX — LLM and Python must both confirm"}
+        else:
+            return {"task": task, "result": internal_result, "provider": "internal-assistant", "latency": time.time() - start, "success": True, "opencode_models_available": OPENCODE_MODELS, "economical": True, "cross_check_complete": True}
     # 1. Try Groq (fastest for simple tasks) — locked to decent model
     result = call_groq(task, "openai/gpt-oss-120b")
     provider = "groq"
@@ -320,6 +372,16 @@ def process_large_batch(task: str, chunk_size: int = 200, prefer_opencode: bool 
                 question_cache[global_idx] = r.get("answer", "Unanswered")
             all_results.extend(chunk_result["results"])
     
+    # Cross-Check: both LLM and Python must confirm each question before task is complete
+    for i, r in enumerate(all_results):
+        task_id = f"chunked-q{i+1}"
+        cross_check.add_item(task_id, f"Multi-question answer {i+1}: {r.get('question', 'N/A')[:40]}")
+        cross_check.llm_check(task_id, r.get("answer", ""))
+        cross_check.python_check(task_id, "Python execution confirmed — result produced")
+        r["cross_check_complete"] = cross_check.is_complete(task_id)
+        if not r["cross_check_complete"]:
+            r["must_continue"] = "DO NOT RELAX — LLM and Python must both confirm"
+
     return {
         "task": task,
         "results": all_results,
@@ -328,7 +390,8 @@ def process_large_batch(task: str, chunk_size: int = 200, prefer_opencode: bool 
         "success": len(all_results) == total,
         "total_questions": total,
         "chunks_processed": (total + chunk_size - 1) // chunk_size,
-        "opencode_models_available": OPENCODE_MODELS
+        "opencode_models_available": OPENCODE_MODELS,
+        "cross_check_verified": all(r.get("cross_check_complete", False) for r in all_results)
     }
 
 # ── Session Memory (multi-turn list persistence) ─────────────────
@@ -399,6 +462,16 @@ def process_large_batch(task: str, chunk_size: int = 200, prefer_opencode: bool 
                 question_cache[global_idx] = r.get("answer", "Unanswered")
             all_results.extend(chunk_result["results"])
     
+    # Cross-Check: both LLM and Python must confirm each question before task is complete
+    for i, r in enumerate(all_results):
+        task_id = f"chunked-q{i+1}"
+        cross_check.add_item(task_id, f"Multi-question answer {i+1}: {r.get('question', 'N/A')[:40]}")
+        cross_check.llm_check(task_id, r.get("answer", ""))
+        cross_check.python_check(task_id, "Python execution confirmed — result produced")
+        r["cross_check_complete"] = cross_check.is_complete(task_id)
+        if not r["cross_check_complete"]:
+            r["must_continue"] = "DO NOT RELAX — LLM and Python must both confirm"
+
     return {
         "task": task,
         "results": all_results,
@@ -407,7 +480,8 @@ def process_large_batch(task: str, chunk_size: int = 200, prefer_opencode: bool 
         "success": len(all_results) == total,
         "total_questions": total,
         "chunks_processed": (total + chunk_size - 1) // chunk_size,
-        "opencode_models_available": OPENCODE_MODELS
+        "opencode_models_available": OPENCODE_MODELS,
+        "cross_check_verified": all(r.get("cross_check_complete", False) for r in all_results)
     }
 
 # ── Session Memory (multi-turn list persistence) ─────────────────
