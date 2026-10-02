@@ -47,7 +47,17 @@ class ProviderState:
 
 groq_s = ProviderState("Groq")
 provider_s = ProviderState("ProviderConsole")  # Local multi-instance opencode + Groq
+# OpenRouter: hardened circuit breaker — 60s cooldown, 5 failures before open, verbose logging
 openrouter_s = ProviderState("OpenRouter")
+openrouter_s.max_failures = 5  # More tolerant before opening
+openrouter_s.cooldown_seconds = 60  # 60s cooldown (was 30s)
+openrouter_s.enabled = False  # DISABLED BY DEFAULT — opt-in via env OPENROUTER_ENABLED=1
+import os
+if os.getenv("OPENROUTER_ENABLED") == "1":
+    openrouter_s.enabled = True
+    print("[OPENROUTER] ENABLED via OPENROUTER_ENABLED=1 — will be used as LAST RESORT only")
+else:
+    print("[OPENROUTER] DISABLED by default (set OPENROUTER_ENABLED=1 to enable) — Groq + Provider Console only")
 # ── Massive Context + Secondary Model Warm-up (engineered) ──────────
 # Author: Buddy | Verified: Bruce / Luke / Simone
 # Context window expanded to 32768 (was ~4k via provider default)
@@ -259,7 +269,8 @@ def process_auto(task: str, prefer_opencode: bool = False) -> Dict[str, Any]:
         result = call_provider(task, opencode_model)
         if result: provider = "provider-console-opencode"
     
-    # 3. If Provider Console fails → OpenRouter (last, protected by circuit breaker)
+    # 3. If Provider Console fails → OpenRouter (LAST RESORT, protected by strict circuit breaker)
+    # OpenRouter only called if: enabled via env + key present + circuit closed + 60s cooldown passed
     if not result:
         result = call_openrouter(task, "openrouter/free")
         if result: provider = "openrouter"
