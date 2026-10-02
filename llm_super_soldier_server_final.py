@@ -255,10 +255,13 @@ def process_auto(task: str, prefer_opencode: bool = False) -> Dict[str, Any]:
             "opencode_models_available": OPENCODE_MODELS
         }
 
-    # 0. Economical internal check: answer what can be answered without LLM
-    internal = assistant.answer_internally(task) if assistant.can_answer(task) else None
-    if internal:
-        return {"task": task, "result": internal, "provider": "internal-assistant", "latency": time.time() - start, "success": True, "opencode_models_available": OPENCODE_MODELS, "economical": True}
+    # 0. Internal assistant: handles pricing/status simple queries quickly (economical)
+    # If it's clearly a pricing/status/basic task → answer internally; else proceed to LLM
+    if assistant.can_answer(task) and ("price" in task.lower() or "cost" in task.lower() or "lkr" in task.lower() or "status" in task.lower() or "health" in task.lower()):
+        internal_result = assistant.answer_internally(task)
+        # Log that we used the economical path but do NOT block the LLM for anything non-trivial
+        # This keeps the assistant from being an "idiot" — it only answers what it clearly can
+        return {"task": task, "result": internal_result, "provider": "internal-assistant", "latency": time.time() - start, "success": True, "opencode_models_available": OPENCODE_MODELS, "economical": True}
     # 1. Try Groq (fastest for simple tasks) — locked to decent model
     result = call_groq(task, "openai/gpt-oss-120b")
     provider = "groq"
