@@ -161,6 +161,16 @@ except Exception as _e:
     KEYROT = None
     print(f"[KEYS] rotation disabled: {_e}")
 
+# ── Server 2: OpenRouter free-tier adapter (independent of Groq) ────
+try:
+    import openrouter_adapter as ORA
+    _oh = ORA.health()
+    print(f"[OPENROUTER] free adapter active - {_oh['free_models']} models, "
+          f"cred={_oh['credential']}, default={_oh['default']}")
+except Exception as _e:
+    ORA = None
+    print(f"[OPENROUTER] adapter disabled: {_e}")
+
 # ── Per-client access control + usage monitoring ───────────────────
 try:
     from access_log import AccessLog, mask as mask_key
@@ -616,11 +626,15 @@ session_memory["parallel_safe"] = ["Self", "Edge"]
 async def v1_models(request: _SSRequest = None):
     if not _auth_ok(request):
         return _deny(request, "auth required")
-    return {"object": "list", "data": [
-        {"id": "supersoldier", "object": "model", "owned_by": "local",
-         "context_window": 32768},
-    ] + [{"id": m, "object": "model", "owned_by": "groq", "context_window": 131072}
-         for m in ALLOWED_MODELS]}
+    data = [{"id": "supersoldier", "object": "model", "owned_by": "local",
+             "context_window": 32768}]
+    data += [{"id": m, "object": "model", "owned_by": "groq",
+              "context_window": 131072} for m in ALLOWED_MODELS]
+    if ORA is not None:
+        # Free second source - selectable by name
+        data += [{"id": m, "object": "model", "owned_by": "openrouter",
+                  "context_window": 32768} for m in ORA.fetch_free_models()]
+    return {"object": "list", "data": data}
 
 
 @app.post("/v1/chat/completions")
@@ -671,11 +685,43 @@ async def v1_chat_completions(req: dict, http_request: _SSRequest = None):
     prompt = user_text
     if system_text:
         prompt = f"{system_text}\n\n{user_text}"
-    result = call_groq(prompt, WARM_MODELS["primary"])
+    # Honour the model the caller actually asked for. Previously this was
+    # hardcoded to the Groq primary, so requesting an OpenRouter free model
+    # silently got Groq instead.
+    want = model
+    result = None
     served_by = "llm"
-    if result is None:
-        result = call_provider(user_text, WARM_MODELS["fallback"])
+
+    if want.endswith(":free") and ORA is not None:
+        # Explicit free-OpenRouter request
+        try:
+            ans, used = ORA.chat(prompt, model=want)
+            if ans:
+                result, served_by = ans, f"openrouter-free:{used}"
+        except Exception:
+            pass
+    elif want in ALLOWED_MODELS:
+        result = call_groq(prompt, want)
+        served_by = f"groq:{want}"
+
+    if result is None and ORA is not None and not want.endswith(":free"):
+        # Second source: free OpenRouter. Independent of every Groq key, so a
+        # Groq rate-limit can no longer stall the server.
+        try:
+            ans, used = ORA.chat(prompt)
+            if ans:
+                result, served_by = ans, f"openrouter-free:{used}"
+        except Exception:
+            pass
+
+    if result is None and want.startswith("opencode/"):
+        result = call_provider(user_text, want)
         served_by = "provider-console"
+
+    if result is None and not want.endswith(":free"):
+        result = call_groq(prompt, WARM_MODELS["primary"])
+        served_by = f"groq:{WARM_MODELS['primary']}"
+
     if result is None:
         result = call_openrouter(user_text, "openrouter/free")
         served_by = "openrouter"
@@ -912,6 +958,21 @@ async def whoami(request: _SSRequest):
     return JSONResponse({"error": "not authenticated"}, status_code=401)
 
 
+@app.get("/openrouter/stats")
+async def openrouter_stats():
+    """Free OpenRouter models available as a second source."""
+    if ORA is None:
+        return JSONResponse({"status": "adapter_disabled"}, status_code=503)
+    return JSONResponse({"status": "ok", **ORA.health()})
+
+
+@app.post("/openrouter/refresh")
+async def openrouter_refresh():
+    if ORA is None:
+        return JSONResponse({"status": "adapter_disabled"}, status_code=503)
+    return JSONResponse({"status": "ok", "free_models": ORA.fetch_free_models(force=True)})
+
+
 if __name__ == "__main__":
     print("=== SUPER-SOLDIER AUTO-ROUTER STARTED ===")
     print("Order: Groq -> Provider Console (Local multi-instance opencode) -> OpenRouter (last)")
@@ -920,5 +981,23 @@ if __name__ == "__main__":
     # on a different port, and be exposed to the LAN only when you choose.
     _host = os.getenv("SS_HOST", "127.0.0.1")   # 0.0.0.0 = reachable on the LAN
     _port = int(os.getenv("SS_PORT", "8082"))
+
+    # Fail loudly if something already owns the port. Without this, uvicorn
+    # exits with a bare "[Errno 10048]" and an ORPHANED older process keeps
+    # serving stale code -- which silently invalidates every later test.
+    import socket
+    _probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        _probe.settimeout(1.0)
+        if _probe.connect_ex(("127.0.0.1", _port)) == 0:
+            print(f"[SERVE] ABORT: port {_port} is already in use by another "
+                  f"process. An older Super-Soldier is probably still running.")
+            print(f"[SERVE] find it:  netstat -ano | findstr :{_port}")
+            print(f"[SERVE] kill it:  taskkill /F /PID <pid>")
+            print("[SERVE] nothing was started.")
+            raise SystemExit(1)
+    finally:
+        _probe.close()
+
     print(f"[SERVE] http://{_host}:{_port}  (UI: /ui)")
     uvicorn.run(app, host=_host, port=_port)

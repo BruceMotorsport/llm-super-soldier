@@ -59,26 +59,54 @@ class CacheRung:
         self.db_path = db_path
         self.hits = 0
         self.misses = 0
+        self._db_ready = False
         self._init_db()
 
     def _init_db(self):
-        with self._lock:
-            con = sqlite3.connect(self.db_path)
-            con.execute(
-                """CREATE TABLE IF NOT EXISTS answers(
-                       key TEXT PRIMARY KEY,
-                       question TEXT,
-                       answer TEXT,
-                       served_by TEXT,
-                       persona TEXT,
-                       created REAL,
-                       hits INTEGER DEFAULT 0)"""
-            )
-            con.commit()
-            con.close()
+        self._ensure_db()
+
+    def _ensure_db(self) -> bool:
+        """(Re)create the table if missing. Returns False if unusable."""
+        try:
+            with self._lock:
+                con = sqlite3.connect(self.db_path)
+                con.execute(
+                    """CREATE TABLE IF NOT EXISTS answers(
+                           key TEXT PRIMARY KEY,
+                           question TEXT,
+                           answer TEXT,
+                           served_by TEXT,
+                           persona TEXT,
+                           created REAL,
+                           hits INTEGER DEFAULT 0)"""
+                )
+                con.commit()
+                con.close()
+            self._db_ready = True
+            return True
+        except sqlite3.Error:
+            # Unwritable path or similar — run without persistence rather
+            # than failing every request. The ladder still works in-memory
+            # via the other rungs.
+            self._db_ready = False
+            return False
 
     def get(self, question: str, persona: str = "") -> Optional[str]:
         key = _norm_key(f"{persona}::{question}")
+        try:
+            return self._get(key)
+        except sqlite3.Error:
+            # Table/file vanished under us (e.g. db deleted while running).
+            # Recreate once and retry; on failure treat as a miss.
+            if self._ensure_db():
+                try:
+                    return self._get(key)
+                except sqlite3.Error:
+                    pass
+            self.misses += 1
+            return None
+
+    def _get(self, key: str) -> Optional[str]:
         with self._lock:
             con = sqlite3.connect(self.db_path)
             row = con.execute(
@@ -102,6 +130,17 @@ class CacheRung:
         return answer
 
     def put(self, question: str, answer: str, served_by: str, persona: str = ""):
+        """Cache a result. Never raises — losing a cache write is fine."""
+        try:
+            self._put(question, answer, served_by, persona)
+        except sqlite3.Error:
+            self._ensure_db()
+            try:
+                self._put(question, answer, served_by, persona)
+            except sqlite3.Error:
+                pass
+
+    def _put(self, question: str, answer: str, served_by: str, persona: str = ""):
         key = _norm_key(f"{persona}::{question}")
         with self._lock:
             con = sqlite3.connect(self.db_path)
@@ -114,10 +153,14 @@ class CacheRung:
             con.close()
 
     def stats(self) -> Dict[str, Any]:
-        with self._lock:
-            con = sqlite3.connect(self.db_path)
-            n = con.execute("SELECT COUNT(*) FROM answers").fetchone()[0]
-            con.close()
+        try:
+            with self._lock:
+                con = sqlite3.connect(self.db_path)
+                n = con.execute("SELECT COUNT(*) FROM answers").fetchone()[0]
+                con.close()
+        except sqlite3.Error:
+            self._ensure_db()
+            n = 0
         return {"entries": n, "hits": self.hits, "misses": self.misses,
                 "db": self.db_path}
 

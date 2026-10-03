@@ -11,3 +11,5 @@ supersoldier_access.db
 
 __pycache__/
 *.pyc
+# openrouter model cache — machine-local, regenerated live
+openrouter_free_models.json
