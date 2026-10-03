@@ -44,7 +44,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 import uvicorn
 
-GROQ_URL = "http://127.0.0.1:9001/v1/chat/completions"  # Provider Console (includes Groq adapter)
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"  # Groq direct — NOT the local console (that caused a 56s loop-stall)
 PROVIDER_URL = "http://127.0.0.1:9001/v1/chat/completions"  # Provider Console — routes to Local multi-instance opencode + Groq
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
@@ -86,9 +86,9 @@ else:
 
 # Secondary warm-model pool (ready to take over on rate-limit / failure)
 WARM_MODELS = {
-    "primary": "opencode/mimo-v2.6-flash-free",      # Main agentic pipeline
-    "reasoning": "opencode/nemotron-3-ultra-free",     # Complex reasoning fallback
-    "fallback": "openai/gpt-oss-120b",                 # Verified 0.02s — warm always
+    "primary": "openai/gpt-oss-120b",            # Groq direct — verified 200 OK 0.59s
+    "reasoning": "openai/gpt-oss-120b",         # Same verified model (others 403-blocked)
+    "fallback": "opencode/mimo-v2.6-flash-free", # Via Provider Console :9001
 }
 WARM_ACTIVE = True  # Keep warm-model initialized at server start
 
@@ -179,12 +179,16 @@ cross_check = CrossCheck()
 # LOCKED MODELS — decent only, no chat-only garbage
 # Author: Buddy (Simone tests/findings / Bruce directives / Luke functionality verified)
 ALLOWED_MODELS = [
-    # Opencode — agentic / tool-use / full-feature (verified through :9001 Provider Console)
-    "opencode/mimo-v2.6-flash-free",      # Best agentic / code / tool-calling (verified)
+    # Groq direct (api.groq.com) — ONLY verified-reachable model on this key
+    "openai/gpt-oss-120b",                # Verified 200 OK, 0.59s, reasoning+content, ctx 131072
+    # Opencode via :9001 Provider Console — verified reachable
+    "opencode/mimo-v2.6-flash-free",      # Best agentic / code / tool-calling
     "opencode/nemotron-3-ultra-free",     # Ultra-capacity for complex reasoning
-    # Groq via :9001 — verified working (openai/* models respond in ~0.02s with finish=stop)
-    "openai/gpt-oss-120b",                # Verified: responds with reasoning, finish=stop
-    # Note: "openai/gpt-oss-120b" HANGS (30s timeout) — EXCLUDED; space-bunny/muse-spark low-quality — EXCLUDED
+    # EXCLUDED (HTTP 403 blocked at project level on this key, 2026-10-03):
+    #   openai/gpt-oss-20b, openai/gpt-oss-safeguard-20b, qwen/qwen3.8-27b,
+    #   allam-2-7b, meta-llama/llama-prompt-guard-2-22m
+    # EXCLUDED (HTTP 400, needs paid tier): canopylabs/orpheus-*
+    # EXCLUDED (not chat): whisper-large-v3, whisper-large-v3-turbo
 ]
 # Whitelist enforcement: any model not in ALLOWED_MODELS is rejected at server entry
 
@@ -208,10 +212,12 @@ def call_provider(prompt: str, model: str) -> Optional[str]:
     ALLOWED_FREE_MODELS = {"opencode/mimo-v2.6-flash-free","opencode/nemotron-3-ultra-free"}
     selected_model = model if (model in ALLOWED_FREE_MODELS) else "opencode/mimo-v2.6-flash-free"
     payload = {"model": selected_model,
-               "messages": [{"role":"user","content":prompt}],
-               "max_tokens": 8192, "temperature": 0.1, "context_length": 32768}
+               "messages": [{"role": "user", "content": prompt}],
+               "max_tokens": 2048, "temperature": 0.1}
     try:
-        resp = requests.post(PROVIDER_URL, json=payload, timeout=30)
+        resp = requests.post(PROVIDER_URL, json=payload, timeout=25,
+                             headers={"Authorization": "Bearer dummy",
+                                      "Content-Type": "application/json"})
         if resp.status_code == 200:
             provider_s.ok()
             return resp.json()["choices"][0]["message"]["content"].strip()[:500]
@@ -226,10 +232,12 @@ def call_groq(prompt: str, model: str) -> Optional[str]:
     if model and model not in ALLOWED_MODELS:
         model = "openai/gpt-oss-120b"  # Fallback to verified working model
     payload = {"model": model or "openai/gpt-oss-120b",
-               "messages": [{"role":"user","content":prompt}],
-               "max_tokens": 8192, "temperature": 0.1, "context_length": 32768}
+               "messages": [{"role": "user", "content": prompt}],
+               "max_tokens": 2048, "temperature": 0.1}
     try:
-        resp = requests.post(GROQ_URL, json=payload, timeout=30)
+        resp = requests.post(GROQ_URL, json=payload, timeout=25,
+                             headers={"Authorization": f"Bearer {GROQ_KEY}",
+                                      "Content-Type": "application/json"})
         if resp.status_code == 200:
             groq_s.ok()
             return resp.json()["choices"][0]["message"]["content"].strip()[:500]
@@ -269,6 +277,8 @@ def pick_opencode_model(task: str) -> str:
 # ── Full Auto-Route (no manual selection needed) ─────────────────
 def process_auto(task: str, prefer_opencode: bool = False) -> Dict[str, Any]:
     start = time.time()
+    # Reset interquestion cache per batch — indices are batch-relative, never carry over
+    question_cache.clear()
     # --- List-mode: execute sequential from DB if list detected ---
     if session_memory.get("test_list") and any(k in task.lower() for k in ["self-test", "full list", "execute sequentially", "test list"]):
         return execute_list_sequence(session_memory["test_list"])
@@ -286,7 +296,11 @@ def process_auto(task: str, prefer_opencode: bool = False) -> Dict[str, Any]:
     if len(question_lines) >= 2:
         results = []
         for i, question in enumerate(question_lines):
-            result = assistant.call_llm_economical(question, "opencode/mimo-v2.6-flash-free")
+            # Cache-first: serve from cache if this index was already answered
+            if i in question_cache:
+                results.append({"question": question, "answer": question_cache[i], "provider": "cache"})
+                continue
+            result = assistant.call_llm_economical(question, WARM_MODELS["primary"])
             provider = "groq"
             if not result:
                 result = call_provider(question, "opencode/mimo-v2.6-flash-free")
@@ -298,14 +312,23 @@ def process_auto(task: str, prefer_opencode: bool = False) -> Dict[str, Any]:
             answer_text = result or "Unanswered"
             question_cache[i] = answer_text
             # If this question asks about a previous answer, inject cache context
-            ref_match = __import__('re').search(r"question\s+(\d+)", question, __import__('re').IGNORECASE)
+            ref_match = re.search(r"question\s+(\d+)", question, re.IGNORECASE)
             if ref_match:
                 ref_idx = int(ref_match.group(1)) - 1  # 0-based
                 if 0 <= ref_idx < i and ref_idx in question_cache:
                     # Build context with prior answers
-                    context_text = f"Prior answers: Q{ref_idx+1}={question_cache.get(ref_idx, 'N/A')}. Now answer: {question}"
-                    # Re-ask with context (only if reference detected)
-                    result = call_provider(context_text, "opencode/mimo-v2.6-flash-free") or result
+                    prior = question_cache.get(ref_idx, "")
+                    pure_ref = re.match(r"^\s*(what|which|tell me)?\s*(is|was)?\s*(the\s+)?(answer|response|result)?\s*(to\s+)?question\s+\d+\s*\?*\s*$", question, re.IGNORECASE)
+                    if pure_ref:
+                        # Pure back-reference — serve the cached answer verbatim, no LLM echo
+                        result = prior or result
+                    else:
+                        context_text = (f"Known prior answer - Q{ref_idx+1}: {prior}\n\n"
+                                        f"Now answer this question, using that context where relevant.\n"
+                                        f"Question: {question}\n"
+                                        f"Reply with the direct answer only. Do not restate the question.")
+                        # Re-ask via Groq direct (call_provider depends on the stalled :9001 console)
+                        result = call_groq(context_text, WARM_MODELS["primary"]) or result
                     answer_text = result or answer_text
                     question_cache[i] = answer_text
             results.append({"question": question, "answer": answer_text, "provider": provider})
@@ -444,67 +467,6 @@ async def status():
 async def process(req: dict):
     result = process_auto(req.get("task",""), prefer_opencode=req.get("prefer_opencode", False))
     return JSONResponse(content=result)
-
-
-if __name__ == "__main__":
-    print("=== SUPER-SOLDIER AUTO-ROUTER STARTED ===")
-    print("Order: Groq → Provider Console (Local multi-instance opencode) → OpenRouter (last)")
-    print("Opencode models available:", OPENCODE_MODELS)
-
-# ── Chunked Processing Apparatus ──────────────────────────────────
-# Handles large batches by splitting into chunks to stay within context window.
-# Each chunk is processed independently with interreference cache preserved.
-
-def process_large_batch(task: str, chunk_size: int = 200, prefer_opencode: bool = False) -> Dict[str, Any]:
-    """Process a massive batch by chunking — preserves interreference across chunks."""
-    start = time.time()
-    task_normalized = task.replace('\\n', '\n')
-    lines = [line.strip() for line in task_normalized.split('\n') if line.strip()]
-    if len(lines) == 1:
-        lines = [line.strip() for line in task.split('? ') if line.strip()]
-        lines = [l + '?' for l in lines if l.strip()]
-    question_lines = [line for line in lines if line.endswith('?')]
-    
-    all_results = []
-    total = len(question_lines)
-    
-    for chunk_start in range(0, total, chunk_size):
-        chunk = question_lines[chunk_start:chunk_start + chunk_size]
-        chunk_task = "\n".join(chunk)
-        # Use existing multi-question routine per chunk
-        chunk_result = process_auto(chunk_task, prefer_opencode=prefer_opencode)
-        if chunk_result.get("results"):
-            # Offset result indices to preserve global reference mapping
-            for i, r in enumerate(chunk_result["results"]):
-                global_idx = chunk_start + i
-                r["global_index"] = global_idx
-                # Cache for inter-chunk references
-                question_cache[global_idx] = r.get("answer", "Unanswered")
-            all_results.extend(chunk_result["results"])
-    
-    # Cross-Check: both LLM and Python must confirm each question before task is complete
-    for i, r in enumerate(all_results):
-        task_id = f"chunked-q{i+1}"
-        cross_check.add_item(task_id, f"Multi-question answer {i+1}: {r.get('question', 'N/A')[:40]}")
-        cross_check.llm_check(task_id, r.get("answer", ""))
-        cross_check.python_check(task_id, "Python execution confirmed — result produced")
-        r["cross_check_complete"] = cross_check.is_complete(task_id)
-        if not r["cross_check_complete"]:
-            r["must_continue"] = "DO NOT RELAX — LLM and Python must both confirm"
-
-    return {
-        "task": task,
-        "results": all_results,
-        "provider": "chunked-multi-question",
-        "latency": time.time() - start,
-        "success": len(all_results) == total,
-        "total_questions": total,
-        "chunks_processed": (total + chunk_size - 1) // chunk_size,
-        "opencode_models_available": OPENCODE_MODELS,
-        "cross_check_verified": all(r.get("cross_check_complete", False) for r in all_results)
-    }
-
-# ── Session Memory (multi-turn list persistence) ─────────────────
 session_memory = {}
 session_memory["test_list"] = [
     ("Math", "Calculate 2^10"), ("Math", "Solve 2x²-5x+3=0"), ("Math", "Capital of Mongolia"),
@@ -516,4 +478,10 @@ session_memory["test_list"] = [
 session_memory["completed"] = ["Calculate 2^10", "Solve 2x²-5x+3=0", "Capital of Mongolia"]
 session_memory["priority_order"] = ["Math", "Code", "Text", "Self", "Edge"]
 session_memory["parallel_safe"] = ["Self", "Edge"]
-uvicorn.run(app, host="127.0.0.1", port=8082)
+
+
+if __name__ == "__main__":
+    print("=== SUPER-SOLDIER AUTO-ROUTER STARTED ===")
+    print("Order: Groq -> Provider Console (Local multi-instance opencode) -> OpenRouter (last)")
+    print("Opencode models available:", OPENCODE_MODELS)
+    uvicorn.run(app, host="127.0.0.1", port=8082)
