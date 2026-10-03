@@ -682,6 +682,41 @@ async def keys_stats():
     return JSONResponse({"status": "ok", **KEYROT.stats()})
 
 
+# ── Web Console ───────────────────────────────────────────────────
+_UI_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui", "index.html")
+
+
+@app.get("/ui")
+@app.get("/ui/")
+async def web_console():
+    """Serve the single-page console."""
+    from fastapi.responses import HTMLResponse
+    try:
+        with open(_UI_PATH, encoding="utf-8") as f:
+            return HTMLResponse(f.read())
+    except OSError:
+        return HTMLResponse(
+            "<h1>Console file missing</h1><p>Expected ui/index.html</p>", status_code=500)
+
+
+@app.get("/lan")
+async def lan_info():
+    """Show the URLs other machines need, without exposing secrets."""
+    import socket
+    try:
+        ip = socket.gethostbyname(socket.gethostname())
+    except OSError:
+        ip = "127.0.0.1"
+    return {
+        "note": "Server binds 127.0.0.1 by default; see /lan for what to change.",
+        "local_console": "http://127.0.0.1:8082/ui",
+        "lan_console_if_rebound": f"http://{ip}:8082/ui",
+        "openai_base_local": "http://127.0.0.1:8082/v1",
+        "endpoints": ["/health", "/v1/models", "/v1/chat/completions",
+                      "/ladder/stats", "/keys/stats", "/router/status"],
+    }
+
+
 if __name__ == "__main__":
     print("=== SUPER-SOLDIER AUTO-ROUTER STARTED ===")
     print("Order: Groq -> Provider Console (Local multi-instance opencode) -> OpenRouter (last)")
