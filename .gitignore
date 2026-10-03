@@ -2,3 +2,6 @@
 # Super-Soldier runtime state (cache DB) — machine-local, never committed
 supersoldier_cache.db
 *.db
+
+# access/request log DBs — machine-local runtime state
+supersoldier_access.db

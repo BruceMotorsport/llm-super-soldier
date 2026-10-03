@@ -40,7 +40,7 @@ Built for Bruce's architecture: Groq Bridge (:8080), Provider Console (:9001), O
 """
 import requests, time, os, re
 from typing import Optional, Dict, Any
-from fastapi import FastAPI
+from fastapi import FastAPI, Request as _SSRequest
 from fastapi.responses import JSONResponse
 import uvicorn
 
@@ -161,6 +161,17 @@ except Exception as _e:
     KEYROT = None
     print(f"[KEYS] rotation disabled: {_e}")
 
+# ── Per-client access control + usage monitoring ───────────────────
+try:
+    from access_log import AccessLog, mask as mask_key
+    ACCESS = AccessLog()
+    print(f"[ACCESS] auth={'ON' if ACCESS.auth_required else 'off'} "
+          f"| clients={len(ACCESS._clients)} | rate limit="
+          f"{__import__('os').getenv('SS_RATE_LIMIT', '60')}/min")
+except Exception as _e:
+    ACCESS = None
+    print(f"[ACCESS] disabled: {_e}")
+
 # ── Cross-Check Protocol (LLM ↔ Python Bots — task completion verification) ──
 # Author: Buddy | Directive: Bruce / Luke / Simone
 # Before any task is marked done, both sides must confirm.
@@ -209,16 +220,20 @@ cross_check = CrossCheck()
 # LOCKED MODELS — decent only, no chat-only garbage
 # Author: Buddy (Simone tests/findings / Bruce directives / Luke functionality verified)
 ALLOWED_MODELS = [
-    # Groq direct (api.groq.com) — ONLY verified-reachable model on this key
-    "openai/gpt-oss-120b",                # Verified 200 OK, 0.59s, reasoning+content, ctx 131072
-    # Opencode via :9001 Provider Console — verified reachable
+    # Groq direct — verified reachable 2026-10-04 across 4 keys
+    "openai/gpt-oss-120b",                # 4/4 keys, ~0.2-0.9s, ctx 131072
+    "openai/gpt-oss-20b",                 # 3/4 keys (key_1 403s) — smaller/faster
+    "qwen/qwen3.8-27b",                   # 3/4 keys (key_1 403s) — strong reasoning
+    # Opencode via :9001 Provider Console
     "opencode/mimo-v2.6-flash-free",      # Best agentic / code / tool-calling
     "opencode/nemotron-3-ultra-free",     # Ultra-capacity for complex reasoning
-    # EXCLUDED (HTTP 403 blocked at project level on this key, 2026-10-03):
-    #   openai/gpt-oss-20b, openai/gpt-oss-safeguard-20b, qwen/qwen3.8-27b,
-    #   allam-2-7b, meta-llama/llama-prompt-guard-2-22m
-    # EXCLUDED (HTTP 400, needs paid tier): canopylabs/orpheus-*
+    # EXCLUDED — 0/4 keys (project-blocked on every key we hold):
+    #   openai/gpt-oss-safeguard-20b, allam-2-7b,
+    #   meta-llama/llama-prompt-guard-2-22m
+    # EXCLUDED (HTTP 400, paid tier): canopylabs/orpheus-*
     # EXCLUDED (not chat): whisper-large-v3, whisper-large-v3-turbo
+    # NOTE: model access is per-PROJECT, not per-key. Rotation picks a key
+    # that works; if a model 403s on the chosen key, failover retries another.
 ]
 # Whitelist enforcement: any model not in ALLOWED_MODELS is rejected at server entry
 
@@ -603,11 +618,20 @@ async def v1_models():
 
 
 @app.post("/v1/chat/completions")
-async def v1_chat_completions(req: dict):
+async def v1_chat_completions(req: dict, http_request: _SSRequest = None):
+    _t0 = time.time()
+    ok, code, body = await _guard(http_request, "/v1/chat/completions")
+    if not ok:
+        if http_request is not None:
+            ACCESS.record("blocked", "-", "/v1/chat/completions", "", "-", False,
+                          (time.time() - _t0) * 1000, code) if ACCESS else None
+        return JSONResponse(body, status_code=code)
+
     model = req.get("model", "supersoldier")
     messages = req.get("messages", [])
     temperature = req.get("temperature", 0.1)
     max_tokens = req.get("max_tokens", 2048)
+    _client = ACCESS.authenticate(_client_key(http_request)).client if ACCESS else "open"
 
     # Split system messages out — the ladder/persona owns identity, not the client
     system_text = "\n".join(m["content"] for m in messages if m.get("role") == "system")
@@ -623,6 +647,8 @@ async def v1_chat_completions(req: dict):
         if hit:
             if LADDER_CACHE_LLM and hit["served_by"] == "llm":
                 pass
+            _log_use(http_request, _client, "/v1/chat/completions", model,
+                     hit["served_by"], False, (time.time() - _t0) * 1000, 200)
             return JSONResponse({
                 "id": f"ss-{int(time.time()*1000)}",
                 "object": "chat.completion",
@@ -657,6 +683,8 @@ async def v1_chat_completions(req: dict):
     if LADDER is not None and req.get("cache_llm", True) and served_by == "llm":
         LADDER.record_llm_answer(user_text, result)
 
+    _log_use(http_request, _client, "/v1/chat/completions", model,
+             served_by, True, (time.time() - _t0) * 1000, 200)
     return JSONResponse({
         "id": f"ss-{int(time.time()*1000)}",
         "object": "chat.completion",
@@ -674,6 +702,41 @@ async def ladder_stats():
         return JSONResponse({"status": "ladder_disabled"}, status_code=503)
     return JSONResponse({"status": "ok", **LADDER.stats()})
 
+
+# ── Auth + rate-limit + usage logging (applied to protected routes) ──
+def _client_key(req: _SSRequest) -> str:
+    auth = req.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return req.headers.get("x-api-key", "").strip()
+
+
+async def _guard(req: _SSRequest, path: str, model: str = ""):
+    """Returns (ok, status_code, body). Never raises — auth must not 500."""
+    if ACCESS is None:
+        return True, 200, None
+    key = _client_key(req)
+    res = ACCESS.authenticate(key)
+    if not res.ok:
+        return False, 401, {"error": {"message": res.reason,
+                                      "type": "auth_error"}}
+    ok, retry = ACCESS.check_rate(res.client)
+    if not ok:
+        return False, 429, {"error": {"message":
+                                      f"rate limit: {RATE_LIMIT_HINT}/min",
+                                      "type": "rate_limit_error",
+                                      "retry_after": retry}}
+    return True, 200, None
+
+
+RATE_LIMIT_HINT = __import__("os").getenv("SS_RATE_LIMIT", "60")
+
+
+def _log_use(req, client, path, model, served_by, llm_called, ms, status):
+    if ACCESS is None:
+        return
+    ACCESS.record(client, mask_key(_client_key(req)) if _client_key(req) else "-",
+                  path, model, served_by, llm_called, ms, status)
 
 @app.get("/keys/stats")
 async def keys_stats():
@@ -715,6 +778,22 @@ async def lan_info():
         "endpoints": ["/health", "/v1/models", "/v1/chat/completions",
                       "/ladder/stats", "/keys/stats", "/router/status"],
     }
+
+
+@app.get("/usage")
+async def usage(hours: int = 24):
+    """Who used what, and what it cost in quota."""
+    if ACCESS is None:
+        return JSONResponse({"status": "access_disabled"}, status_code=503)
+    since = time.time() - (hours * 3600)
+    return JSONResponse({"status": "ok", **ACCESS.stats(since)})
+
+
+@app.post("/usage/purge")
+async def usage_purge(days: int = 30):
+    if ACCESS is None:
+        return JSONResponse({"status": "access_disabled"}, status_code=503)
+    return JSONResponse({"deleted": ACCESS.purge(days)})
 
 
 if __name__ == "__main__":
