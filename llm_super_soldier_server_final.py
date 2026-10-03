@@ -583,7 +583,9 @@ async def health():
     return JSONResponse({"status":"ok","server":"super-soldier","port":8082,"routes":["groq","provider-console","openrouter"]})
 
 @app.get("/router/status")
-async def status():
+async def status(request: _SSRequest = None):
+    if not _auth_ok(request):
+        return _deny(request, "auth required")
     return JSONResponse({
         "groq_open": groq_s.open, "provider_open": provider_s.open, "openrouter_open": openrouter_s.open,
         "order": ["groq","provider-console-opencode","openrouter"],
@@ -591,7 +593,9 @@ async def status():
     })
 
 @app.post("/process")
-async def process(req: dict):
+async def process(req: dict, request: _SSRequest = None):
+    if not _auth_ok(request):
+        return _deny(request, "auth required")
     result = process_auto(req.get("task",""), prefer_opencode=req.get("prefer_opencode", False))
     return JSONResponse(content=result)
 session_memory = {}
@@ -609,7 +613,9 @@ session_memory["parallel_safe"] = ["Self", "Edge"]
 
 # ── OpenAI-Compatible API (real /v1 endpoints) ─────────────────────
 @app.get("/v1/models")
-async def v1_models():
+async def v1_models(request: _SSRequest = None):
+    if not _auth_ok(request):
+        return _deny(request, "auth required")
     return {"object": "list", "data": [
         {"id": "supersoldier", "object": "model", "owned_by": "local",
          "context_window": 32768},
@@ -697,7 +703,9 @@ async def v1_chat_completions(req: dict, http_request: _SSRequest = None):
 
 
 @app.get("/ladder/stats")
-async def ladder_stats():
+async def ladder_stats(request: _SSRequest = None):
+    if not _auth_ok(request):
+        return _deny(request, "auth required")
     if LADDER is None:
         return JSONResponse({"status": "ladder_disabled"}, status_code=503)
     return JSONResponse({"status": "ok", **LADDER.stats()})
@@ -739,7 +747,9 @@ def _log_use(req, client, path, model, served_by, llm_called, ms, status):
                   path, model, served_by, llm_called, ms, status)
 
 @app.get("/keys/stats")
-async def keys_stats():
+async def keys_stats(request: _SSRequest = None):
+    if not _auth_ok(request):
+        return _deny(request, "auth required")
     if KEYROT is None:
         return JSONResponse({"status": "rotation_disabled"}, status_code=503)
     return JSONResponse({"status": "ok", **KEYROT.stats()})
@@ -751,9 +761,14 @@ _UI_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui", "index
 
 @app.get("/ui")
 @app.get("/ui/")
-async def web_console():
-    """Serve the single-page console."""
+async def web_console(request: _SSRequest = None):
+    """Serve the single-page console (requires a session when auth is on)."""
     from fastapi.responses import HTMLResponse
+    if request is not None and not _auth_ok(request):
+        if wants_html(request):
+            from fastapi.responses import RedirectResponse
+            return RedirectResponse("/login", status_code=302)
+        return _deny(request, "auth required")
     try:
         with open(_UI_PATH, encoding="utf-8") as f:
             return HTMLResponse(f.read())
@@ -781,7 +796,9 @@ async def lan_info():
 
 
 @app.get("/usage")
-async def usage(hours: int = 24):
+async def usage(hours: int = 24, request: _SSRequest = None):
+    if not _auth_ok(request):
+        return _deny(request, "auth required")
     """Who used what, and what it cost in quota."""
     if ACCESS is None:
         return JSONResponse({"status": "access_disabled"}, status_code=503)
@@ -790,14 +807,118 @@ async def usage(hours: int = 24):
 
 
 @app.post("/usage/purge")
-async def usage_purge(days: int = 30):
+async def usage_purge(days: int = 30, request: _SSRequest = None):
+    if not _auth_ok(request):
+        return _deny(request, "auth required")
     if ACCESS is None:
         return JSONResponse({"status": "access_disabled"}, status_code=503)
     return JSONResponse({"deleted": ACCESS.purge(days)})
+
+
+# ── Security: headers on every response, auth on every protected route ──
+try:
+    from security import (SECURITY_HEADERS, PUBLIC_PATHS, COOKIE, MAX_BODY,
+                          bearer_from, wants_html, make_session, verify_session,
+                          apply_headers, SECRET as SESSION_SECRET_SET)
+    SECURE_OK = True
+except Exception as _e:
+    SECURE_OK = False
+    print(f"[SECURITY] middleware unavailable: {_e}")
+
+
+@app.middleware("http")
+async def _security_middleware(request: _SSRequest, call_next):
+    """Applies security headers to everything, and refuses oversized bodies."""
+    try:
+        clen = int(request.headers.get("content-length") or 0)
+    except ValueError:
+        clen = 0
+    if clen > (MAX_BODY if SECURE_OK else 2 * 1024 * 1024):
+        return JSONResponse({"error": {"message": "payload too large",
+                                       "type": "payload_error"}},
+                            status_code=413)
+    resp = await call_next(request)
+    if SECURE_OK:
+        apply_headers(resp)
+    return resp
+
+
+def _auth_ok(request) -> bool:
+    """True when the caller may use a protected route."""
+    if not SECURE_OK or ACCESS is None:
+        return True
+    if not ACCESS.auth_required:
+        return True
+    # A browser session cookie counts, so the console works without JS keys.
+    if verify_session(request.cookies.get(COOKIE, "")):
+        return True
+    key = bearer_from(request)
+    if not key:
+        return False
+    return ACCESS.authenticate(key).ok
+
+
+def _deny(request, reason: str):
+    if wants_html(request):
+        return JSONResponse({"error": reason}, status_code=401)
+    return JSONResponse({"error": {"message": reason, "type": "auth_error"}},
+                        status_code=401)
+
+
+@app.get("/login")
+async def login_page():
+    from fastapi.responses import HTMLResponse
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui", "login.html")
+    try:
+        with open(p, encoding="utf-8") as f:
+            return HTMLResponse(f.read())
+    except OSError:
+        return HTMLResponse("<h1>login.html missing</h1>", status_code=500)
+
+
+@app.post("/login")
+async def login_submit(req: dict):
+    """Exchange a client key for a signed session cookie."""
+    if ACCESS is None:
+        return JSONResponse({"error": {"message": "access control disabled",
+                                       "type": "server_error"}}, status_code=503)
+    if not ACCESS.auth_required:
+        return JSONResponse({"ok": True, "note": "auth not required on this host"})
+    key = (req.get("key") or "").strip()
+    res = ACCESS.authenticate(key)
+    if not res.ok:
+        return JSONResponse({"error": res.reason or "invalid key"}, status_code=401)
+    cookie = make_session(res.client)
+    return JSONResponse({"ok": True, "client": res.client},
+                        headers={"Set-Cookie": f"{COOKIE}={cookie}; HttpOnly; SameSite=Strict; Path=/"})
+
+
+@app.post("/logout")
+async def logout():
+    return JSONResponse({"ok": True},
+                        headers={"Set-Cookie": f"{COOKIE}=; Max-Age=0; Path=/"})
+
+
+@app.get("/whoami")
+async def whoami(request: _SSRequest):
+    if ACCESS is None or not ACCESS.auth_required:
+        return {"client": "open", "auth_required": False}
+    u = verify_session(request.cookies.get(COOKIE, ""))
+    if u:
+        return {"client": u, "via": "session"}
+    k = bearer_from(request)
+    if k and ACCESS.authenticate(k).ok:
+        return {"client": ACCESS.authenticate(k).client, "via": "bearer"}
+    return JSONResponse({"error": "not authenticated"}, status_code=401)
 
 
 if __name__ == "__main__":
     print("=== SUPER-SOLDIER AUTO-ROUTER STARTED ===")
     print("Order: Groq -> Provider Console (Local multi-instance opencode) -> OpenRouter (last)")
     print("Opencode models available:", OPENCODE_MODELS)
-    uvicorn.run(app, host="127.0.0.1", port=8082)
+    # Bind/port are env-configurable so the same build can run on any machine,
+    # on a different port, and be exposed to the LAN only when you choose.
+    _host = os.getenv("SS_HOST", "127.0.0.1")   # 0.0.0.0 = reachable on the LAN
+    _port = int(os.getenv("SS_PORT", "8082"))
+    print(f"[SERVE] http://{_host}:{_port}  (UI: /ui)")
+    uvicorn.run(app, host=_host, port=_port)
