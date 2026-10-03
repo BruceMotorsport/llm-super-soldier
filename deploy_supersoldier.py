@@ -168,12 +168,40 @@ def main():
     # 1. source
     print("\n[1/4] Source")
     if os.path.isdir(os.path.join(d, ".git")):
+        # A dirty tree blocks `git pull`. Stash it -- NEVER `reset --hard`,
+        # which destroys local work that is not this script's to delete.
+        stashed = False
+        dirty = subprocess.run(["git", "-C", d, "status", "--porcelain"],
+                               capture_output=True, text=True)
+        n_local = len(dirty.stdout.strip().splitlines())
+        if n_local:
+            say(WARN, f"{n_local} local change(s) found - stashing (nothing lost)")
+            s = subprocess.run(["git", "-C", d, "stash", "push", "-u", "-m",
+                                "auto-stash by deploy_supersoldier"],
+                               capture_output=True, text=True)
+            stashed = s.returncode == 0
+            if not stashed:
+                say(WARN, f"could not stash: {s.stderr.strip()[:140]}")
+                say(WARN, "resolve git by hand, then re-run. Nothing was changed.")
+
         r = subprocess.run(["git", "-C", d, "pull", "--ff-only", "origin", "master"],
                            capture_output=True, text=True)
-        say(OK if r.returncode == 0 else BAD, "pulled latest" if r.returncode == 0
-            else f"pull failed: {r.stderr.strip()[:120]}")
         if r.returncode != 0:
+            say(BAD, f"pull failed: {(r.stderr or r.stdout).strip()[:160]}")
+            if stashed:
+                say(WARN, "your local changes are safe in the stash (nothing lost).")
+                say(WARN, f'    see them:  cd "{d}" && git stash list')
+                say(WARN, f'    restore:   cd "{d}" && git stash pop')
             sys.exit(1)
+        say(OK, "pulled latest")
+
+        if stashed:
+            say(WARN, "your local changes were set aside, NOT merged.")
+            print(f'       To bring them back:  cd "{d}" && git stash pop')
+            print( "       If that reports a conflict, your edit and the new server")
+            print( "       file touched the same lines. The stash is KEPT, so nothing")
+            print( "       is lost - ask Bruce rather than forcing it.")
+            print( "       To discard your edit deliberately: git stash drop")
     else:
         if os.path.isdir(d):
             shutil.rmtree(d)

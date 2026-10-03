@@ -43,6 +43,38 @@ Useful flags:
 - `python deploy_supersoldier.py --check`  → verify an existing install
 - `python deploy_supersoldier.py --no-start` → install only, don't start
 
+### If git complains about local changes
+
+If you ever see:
+
+```
+error: Your local changes would be overwritten by merge
+```
+
+that means you edited a file in the clone AND the repo moved forward.
+**Do not run `git reset --hard`** — that throws your work away.
+
+`deploy_supersoldier.py` now handles this for you: it stashes your changes,
+pulls, and tells you how to get them back. You will see:
+
+```
+[--] N local change(s) found - stashing (nothing lost)
+[OK] pulled latest
+[--] your local changes were set aside, NOT merged.
+```
+
+To bring them back:
+
+```
+cd "C:\Users\<you>\llm-super-soldier"
+git stash list        # see what is set aside
+git stash pop         # restore it
+```
+
+If `git stash pop` reports a conflict, your edit and the updated file touched
+the same lines. **The stash is kept, so nothing is lost.** Send the conflict
+to Buddy rather than forcing it with `--force`.
+
 ---
 
 ## STEP 3 — YOUR KEYS
