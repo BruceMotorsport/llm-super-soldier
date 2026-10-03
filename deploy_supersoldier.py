@@ -119,18 +119,24 @@ def verify() -> bool:
         say(BAD, f"ladder test failed: {e}")
         all_ok = False
 
-    # a real question must reach the LLM and be correct
+    # The LLM path must be PROVEN, not assumed. A cached answer would make
+    # this pass without ever calling Groq, so bypass the cache entirely.
     try:
+        probe = f"What is the capital of France? (verify run {int(time.time())})"
         d = post("/v1/chat/completions",
                  {"model": "supersoldier",
-                  "messages": [{"role": "user", "content": "What is the capital of France?"}]})
+                  "messages": [{"role": "user", "content": probe}]})
         sb = d.get("supersoldier", {})
         ans = d["choices"][0]["message"]["content"].lower()
-        if "paris" in ans:
-            say(OK, f"LLM path works (served_by={sb.get('served_by')})")
-        else:
+        if "paris" not in ans:
             say(BAD, f"LLM returned wrong answer: {ans[:60]!r}")
             all_ok = False
+        elif sb.get("llm_called") is not True:
+            say(BAD, f"LLM path not exercised — served_by={sb.get('served_by')} "
+                     f"(cache hit means this proves nothing)")
+            all_ok = False
+        else:
+            say(OK, f"LLM path works (served_by={sb.get('served_by')}, verified uncached)")
     except Exception as e:
         say(BAD, f"LLM test failed: {e}")
         all_ok = False
