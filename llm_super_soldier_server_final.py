@@ -44,6 +44,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 import uvicorn
 
+LADDER_CACHE_LLM = os.getenv("SS_CACHE_LLM", "1") == "1"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"  # Groq direct — NOT the local console (that caused a 56s loop-stall)
 PROVIDER_URL = "http://127.0.0.1:9001/v1/chat/completions"  # Provider Console — routes to Local multi-instance opencode + Groq
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -98,21 +99,23 @@ class EconomicalAssistant:
     def __init__(self):
         self.cache = {}  # Simple in-memory prompt cache
         self.answered_internally = 0  # Counter — lets us report savings
+        self.last_served_by = None  # Which rung answered (cache/python/...)
     def can_answer(self, prompt: str) -> bool:
-        # Internal rules: simple arithmetic, known config, routing decisions
-        # Don't send to LLM if answer is already in local state
-        if "price" in prompt.lower() or "cost" in prompt.lower() or "lkr" in prompt.lower():
-            return True  # Site pricing answers handled by internal rules (see pricing.md)
-        if len(prompt) < 8 or "hello" in prompt.lower() or "test" in prompt.lower():
-            return True  # Basic greeting / status handled internally
-        return False  # Needs LLM reasoning
+        """True only when the ladder can produce a REAL answer.
+        Never returns a placeholder string dressed as success."""
+        if LADDER is None:
+            return False
+        return LADDER.try_answer(prompt) is not None
     def answer_internally(self, prompt: str) -> Optional[str]:
+        """Return a genuine answer from the ladder, or None."""
         self.answered_internally += 1
-        if "price" in prompt.lower() or "cost" in prompt.lower() or "lkr" in prompt.lower():
-            return "Pricing handled by internal price sheet (see SUPER_SOLDIER_COLIBRI_MAP.md / pricing config) — LLM call skipped for economy."
-        if "status" in prompt.lower() or "health" in prompt.lower():
-            return f"Super-Soldier status OK — server running, model whitelist locked, 3 allowed, 0 chat-only garbage, context 32768. Internal answer only; LLM call skipped."
-        return f"Internal assistant handled: '{prompt[:60]}...' — no external LLM call made."
+        if LADDER is None:
+            return None
+        r = LADDER.try_answer(prompt)
+        if not r:
+            return None
+        self.last_served_by = r["served_by"]
+        return r["answer"]
     def call_llm_economical(self, prompt: str, model: str) -> Optional[str]:
         # Only call LLM if internal rules say it can't be answered
         if self.can_answer(prompt):
@@ -130,6 +133,17 @@ class EconomicalAssistant:
         return "LLM call failed — all warm models and providers exhausted. Answer not available internally or externally."
 
 assistant = EconomicalAssistant()
+
+# ── Answer Ladder (answers its own calls — no LLM needed) ─────────
+try:
+    from answer_ladder import AnswerLadder
+    LADDER = AnswerLadder(
+        local=None,
+    )
+    print("[LADDER] answer ladder active — cache/python/local/web/mcp before LLM")
+except Exception as _e:
+    LADDER = None
+    print(f"[LADDER] DISABLED: {_e}")
 
 # ── Cross-Check Protocol (LLM ↔ Python Bots — task completion verification) ──
 # Author: Buddy | Directive: Bruce / Luke / Simone
@@ -478,6 +492,89 @@ session_memory["test_list"] = [
 session_memory["completed"] = ["Calculate 2^10", "Solve 2x²-5x+3=0", "Capital of Mongolia"]
 session_memory["priority_order"] = ["Math", "Code", "Text", "Self", "Edge"]
 session_memory["parallel_safe"] = ["Self", "Edge"]
+
+
+# ── OpenAI-Compatible API (real /v1 endpoints) ─────────────────────
+@app.get("/v1/models")
+async def v1_models():
+    return {"object": "list", "data": [
+        {"id": "supersoldier", "object": "model", "owned_by": "local",
+         "context_window": 32768},
+    ] + [{"id": m, "object": "model", "owned_by": "groq", "context_window": 131072}
+         for m in ALLOWED_MODELS]}
+
+
+@app.post("/v1/chat/completions")
+async def v1_chat_completions(req: dict):
+    model = req.get("model", "supersoldier")
+    messages = req.get("messages", [])
+    temperature = req.get("temperature", 0.1)
+    max_tokens = req.get("max_tokens", 2048)
+
+    # Split system messages out — the ladder/persona owns identity, not the client
+    system_text = "\n".join(m["content"] for m in messages if m.get("role") == "system")
+    user_text = "\n".join(m["content"] for m in messages
+                          if m.get("role") in ("user", "assistant")).strip()
+
+    if not user_text:
+        return JSONResponse({"error": {"message": "no user content", "type": "bad_request"}}, status_code=400)
+
+    # 1. Try the ladder first — answers without any LLM call
+    if LADDER is not None and req.get("use_ladder", True):
+        hit = LADDER.try_answer(user_text)
+        if hit:
+            if LADDER_CACHE_LLM and hit["served_by"] == "llm":
+                pass
+            return JSONResponse({
+                "id": f"ss-{int(time.time()*1000)}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [{"index": 0, "message": {"role": "assistant",
+                                                     "content": hit["answer"]},
+                             "finish_reason": "stop"}],
+                "supersoldier": {"served_by": hit["served_by"],
+                                 "llm_called": False},
+            })
+
+    # 2. Fall through to the LLM
+    prompt = user_text
+    if system_text:
+        prompt = f"{system_text}\n\n{user_text}"
+    result = call_groq(prompt, WARM_MODELS["primary"])
+    served_by = "llm"
+    if result is None:
+        result = call_provider(user_text, WARM_MODELS["fallback"])
+        served_by = "provider-console"
+    if result is None:
+        result = call_openrouter(user_text, "openrouter/free")
+        served_by = "openrouter"
+
+    if result is None:
+        return JSONResponse(
+            {"error": {"message": "all providers failed or stalled",
+                       "type": "provider_error"}}, status_code=503)
+
+    # Cache LLM answers so the repeat is free
+    if LADDER is not None and req.get("cache_llm", True) and served_by == "llm":
+        LADDER.record_llm_answer(user_text, result)
+
+    return JSONResponse({
+        "id": f"ss-{int(time.time()*1000)}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": result},
+                     "finish_reason": "stop"}],
+        "supersoldier": {"served_by": served_by, "llm_called": True},
+    })
+
+
+@app.get("/ladder/stats")
+async def ladder_stats():
+    if LADDER is None:
+        return JSONResponse({"status": "ladder_disabled"}, status_code=503)
+    return JSONResponse({"status": "ok", **LADDER.stats()})
 
 
 if __name__ == "__main__":

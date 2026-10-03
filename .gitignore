@@ -1,0 +1,4 @@
+
+# Super-Soldier runtime state (cache DB) — machine-local, never committed
+supersoldier_cache.db
+*.db
