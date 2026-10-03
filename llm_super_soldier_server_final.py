@@ -49,7 +49,7 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"  # Groq direct — 
 PROVIDER_URL = "http://127.0.0.1:9001/v1/chat/completions"  # Provider Console — routes to Local multi-instance opencode + Groq
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-GROQ_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_KEY = os.getenv("GROQ_API_KEY", "")  # single-key fallback; KEYROT preferred
 OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY", "")
 
 # ── Provider States (Circuit Breakers) ──────────────────────────
@@ -60,13 +60,20 @@ class ProviderState:
         self.failures = 0; self.open = True
     def fail(self):
         self.failures += 1; self.last_fail = time.time()
-        if self.failures >= 3: self.open = False
+        if self.failures >= getattr(self, "max_failures", 3):
+            self.open = False
     def can(self):
         if self.open: return True
-        if time.time() - self.last_fail > 30: self.open = True; return True
+        cooldown = getattr(self, "cooldown_seconds", 30)
+        if time.time() - self.last_fail > cooldown:
+            self.open = True; self.failures = 0; return True
         return False
 
 groq_s = ProviderState("Groq")
+# A 40-question batch must survive a couple of transient timeouts.
+# Trip at 8 failures with a 60s cooldown instead of 3/30s.
+groq_s.max_failures = 8
+groq_s.cooldown_seconds = 60
 provider_s = ProviderState("ProviderConsole")  # Local multi-instance opencode + Groq
 # OpenRouter: hardened circuit breaker — 60s cooldown, 5 failures before open, verbose logging
 openrouter_s = ProviderState("OpenRouter")
@@ -144,6 +151,15 @@ try:
 except Exception as _e:
     LADDER = None
     print(f"[LADDER] DISABLED: {_e}")
+
+# ── Multi-key Groq rotation (round-robin + failover) ───────────────
+try:
+    from key_rotation import KeyRotator
+    KEYROT = KeyRotator()
+    print(f"[KEYS] groq rotation active — {len(KEYROT.slots)} key(s) loaded")
+except Exception as _e:
+    KEYROT = None
+    print(f"[KEYS] rotation disabled: {_e}")
 
 # ── Cross-Check Protocol (LLM ↔ Python Bots — task completion verification) ──
 # Author: Buddy | Directive: Bruce / Luke / Simone
@@ -240,14 +256,97 @@ def call_provider(prompt: str, model: str) -> Optional[str]:
     except: provider_s.fail()
     return None
 
+_DURATION_RE = re.compile(r"(?:(\d+(?:\.\d+)?)h)?(?:(\d+(?:\.\d+)?)m(?!s))?"
+                          r"(?:(\d+(?:\.\d+)?)s)?(?:(\d+(?:\.\d+)?)ms)?", re.I)
+
+
+def _parse_reset(headers) -> float:
+    """Seconds to wait from rate-limit headers, or 0.0 if unknown.
+
+    Handles Groq's duration format ("9h36m0s", "577ms") as well as plain
+    seconds ("30") and HTTP-date retry-after. Never returns a number so large
+    that a request would hang: capped at 300s.
+    """
+    def _dur(s: str) -> float:
+        s = (s or "").strip().lower()
+        if not s:
+            return 0.0
+        m = _DURATION_RE.fullmatch(s)
+        if not m:
+            try:
+                return float(s)
+            except ValueError:
+                return 0.0
+        h, mins, sec, ms = m.groups()
+        total = 0.0
+        if h:   total += float(h) * 3600
+        if mins: total += float(mins) * 60
+        if sec: total += float(sec)
+        if ms:  total += float(ms) / 1000.0
+        return total
+
+    for hdr in ("x-ratelimit-reset-requests", "x-ratelimit-reset-tokens",
+                "retry-after"):
+        val = headers.get(hdr)
+        if not val:
+            continue
+        secs = _dur(str(val))
+        if secs > 0:
+            return min(secs, 300.0)
+    return 0.0
+
+
 def call_groq(prompt: str, model: str) -> Optional[str]:
-    if not GROQ_KEY or not groq_s.can(): return None
-    # Lock to decent models only — "openai/gpt-oss-120b" hangs (30s timeout), never use it
-    if model and model not in ALLOWED_MODELS:
-        model = "openai/gpt-oss-120b"  # Fallback to verified working model
-    payload = {"model": model or "openai/gpt-oss-120b",
+    """Call Groq, rotating across every configured key with failover."""
+    if not groq_s.can():
+        return None
+    mdl = model if (model in ALLOWED_MODELS) else WARM_MODELS["primary"]
+    payload = {"model": mdl,
                "messages": [{"role": "user", "content": prompt}],
                "max_tokens": 2048, "temperature": 0.1}
+
+    def attempt(slot) -> tuple:
+        """One call with a specific key.
+
+        Returns (ok, result). On failure, `slot.bench_now` controls whether
+        the key is benched: a rate-limit or auth error means THIS KEY is bad
+        (bench it, try another), while a timeout or 5xx is transient (retry
+        the same key once, do not bench).
+        """
+        slot.bench_now = False
+        try:
+            resp = requests.post(
+                GROQ_URL, json=payload, timeout=25,
+                headers={"Authorization": f"Bearer {slot.secret}",
+                         "Content-Type": "application/json"})
+            if resp.status_code == 200:
+                return True, resp.json()["choices"][0]["message"]["content"].strip()[:500]
+            reason = f"http {resp.status_code}"
+            if resp.status_code in (401, 403, 429):
+                slot.bench_now = True        # key-specific problem
+                # Honour the provider's own reset hint instead of guessing.
+                # Groq sends durations like "9h36m0s" / "577ms", NOT plain
+                # seconds, so parse both forms or we silently fall back to
+                # our own backoff and re-trip forever.
+                slot.retry_after = _parse_reset(resp.headers)
+            else:
+                slot.soft_error = reason
+            return False, reason
+        except Exception as e:
+            # timeout / connection reset / DNS — transient, not a bad key
+            slot.soft_error = type(e).__name__
+            return False, slot.soft_error
+
+    if KEYROT is not None and KEYROT.slots:
+        result, _used = KEYROT.call_with_failover(attempt)
+        if result:
+            groq_s.ok()
+            return result
+        groq_s.fail()
+        return None
+
+    if not GROQ_KEY:
+        return None
     try:
         resp = requests.post(GROQ_URL, json=payload, timeout=25,
                              headers={"Authorization": f"Bearer {GROQ_KEY}",
@@ -255,10 +354,9 @@ def call_groq(prompt: str, model: str) -> Optional[str]:
         if resp.status_code == 200:
             groq_s.ok()
             return resp.json()["choices"][0]["message"]["content"].strip()[:500]
-        elif resp.status_code == 429:
-            groq_s.fail(); time.sleep(2)
-        else: groq_s.fail()
-    except: groq_s.fail()
+        groq_s.fail()
+    except Exception:
+        groq_s.fail()
     return None
 
 def call_openrouter(prompt: str, model: str) -> Optional[str]:
@@ -575,6 +673,13 @@ async def ladder_stats():
     if LADDER is None:
         return JSONResponse({"status": "ladder_disabled"}, status_code=503)
     return JSONResponse({"status": "ok", **LADDER.stats()})
+
+
+@app.get("/keys/stats")
+async def keys_stats():
+    if KEYROT is None:
+        return JSONResponse({"status": "rotation_disabled"}, status_code=503)
+    return JSONResponse({"status": "ok", **KEYROT.stats()})
 
 
 if __name__ == "__main__":

@@ -193,6 +193,19 @@ class PythonRung:
             pct, base = float(m.group(1)), float(m.group(2))
             return str(round(base * pct / 100, 6))
 
+        # --- word operators: "28 plus 28" -> "28 + 28" ---
+        # These arrive constantly from batch/eval work and must never cost an
+        # LLM call. Map spoken operators to symbols before the arithmetic check.
+        word_ops = [
+            (r"\bmultiplied\s+by\b|\btimes\b|\bx\b|\bmultiplied\b", "*"),
+            (r"\bdivided\s+by\b|\bdiv\b", "/"),
+            (r"\bplus\b|\badded\s+to\b|\band\b", "+"),
+            (r"\bminus\b|\bsubtracted\s+by\b|\bless\b", "-"),
+        ]
+        for pat, sym in word_ops:
+            q = re.sub(pat, f" {sym} ", q, flags=re.IGNORECASE)
+        q = re.sub(r"\s+", " ", q).strip()
+
         # --- arithmetic — `q` has already had conversational prefixes stripped,
         # so match a bare expression containing an operator
         m = re.fullmatch(r"[0-9\.\+\-\*\/\(\)\s%]+", q)
