@@ -39,7 +39,7 @@ Handles Local opencode selection, OpenRouter max, and all provider fallbacks.
 Built for Bruce's architecture: Groq Bridge (:8080), Provider Console (:9001), OpenRouter direct.
 """
 import requests, time, os, re
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from fastapi import FastAPI, Request as _SSRequest
 from fastapi.responses import JSONResponse
 import uvicorn
@@ -161,15 +161,87 @@ except Exception as _e:
     KEYROT = None
     print(f"[KEYS] rotation disabled: {_e}")
 
-# ── Server 2: OpenRouter free-tier adapter (independent of Groq) ────
-try:
-    import openrouter_adapter as ORA
-    _oh = ORA.health()
-    print(f"[OPENROUTER] free adapter active - {_oh['free_models']} models, "
-          f"cred={_oh['credential']}, default={_oh['default']}")
-except Exception as _e:
-    ORA = None
-    print(f"[OPENROUTER] adapter disabled: {_e}")
+# ── Peer providers (ISOLATED servers, HTTP only — never imported) ────
+# Bruce directive: keep each provider in its own process. Super-Soldier is a
+# CONSUMER here, not a host. If a peer dies or misbehaves, only that request
+# path is affected — never this process.
+PEER_OPENCODE = os.getenv("PEER_OPENCODE_URL", "http://127.0.0.1:8086")
+PEER_OPENROUTER = os.getenv("PEER_OPENROUTER_URL", "http://127.0.0.1:8085")
+PEER_TIMEOUT = int(os.getenv("PEER_TIMEOUT", "60"))
+
+# model-id prefix -> peer base url. Longest prefix wins, so a provider can
+# register its own namespace without touching this table.
+PEER_ROUTES = [
+    ("opencode/", PEER_OPENCODE),
+    ("openrouter/", PEER_OPENROUTER),
+]
+# OpenRouter free model ids are BARE (e.g. "qwen/qwen3.8-27b:free"), so a
+# prefix table cannot match them. The ":free" suffix is unambiguous — no Groq
+# model carries it — so use it as the routing signal.
+PEER_SUFFIXES = [(":free", PEER_OPENROUTER)]
+
+_peer_models_cache: Dict[str, Any] = {"fetched": 0.0, "peers": {}}
+
+
+def peer_models(force: bool = False) -> Dict[str, Any]:
+    """Ask each peer for its model list. Cached; never raises."""
+    now = time.time()
+    if not force and now - _peer_models_cache["fetched"] < 60:
+        return _peer_models_cache["peers"]
+    out: Dict[str, Any] = {}
+    for prefix, base in PEER_ROUTES:
+        try:
+            r = requests.get(base + "/v1/models", timeout=5)
+            if r.status_code == 200:
+                ids = [m["id"] for m in r.json().get("data", [])]
+                out[base] = {"prefix": prefix, "models": ids, "up": True}
+            else:
+                out[base] = {"prefix": prefix, "models": [], "up": False,
+                             "error": f"http {r.status_code}"}
+        except Exception as e:
+            out[base] = {"prefix": prefix, "models": [], "up": False,
+                         "error": type(e).__name__}
+    _peer_models_cache["peers"] = out
+    _peer_models_cache["fetched"] = now
+    return out
+
+
+def call_peer(base: str, model: str, prompt: str) -> Optional[str]:
+    """Call an isolated peer server over HTTP. Returns None on any failure."""
+    try:
+        r = requests.post(
+            base + "/v1/chat/completions",
+            json={"model": model,
+                  "messages": [{"role": "user", "content": prompt}],
+                  "max_tokens": 2048},
+            timeout=PEER_TIMEOUT)
+        if r.status_code == 200:
+            ch = r.json().get("choices") or []
+            if ch:
+                txt = (ch[0].get("message") or {}).get("content")
+                return (txt or "").strip() or None
+        return None
+    except Exception:
+        return None
+
+
+def peer_for(model: str) -> Optional[str]:
+    """Resolve a model id to an isolated peer server, or None if it is local."""
+    for prefix, base in PEER_ROUTES:
+        if model.startswith(prefix):
+            return base
+    for suffix, base in PEER_SUFFIXES:
+        if model.endswith(suffix):
+            return base
+    return None
+
+
+def peer_model_ids() -> List[str]:
+    out: List[str] = []
+    for info in peer_models().values():
+        out.extend(info.get("models", []))
+    return out
+
 
 # ── Per-client access control + usage monitoring ───────────────────
 try:
@@ -630,10 +702,12 @@ async def v1_models(request: _SSRequest = None):
              "context_window": 32768}]
     data += [{"id": m, "object": "model", "owned_by": "groq",
               "context_window": 131072} for m in ALLOWED_MODELS]
-    if ORA is not None:
-        # Free second source - selectable by name
-        data += [{"id": m, "object": "model", "owned_by": "openrouter",
-                  "context_window": 32768} for m in ORA.fetch_free_models()]
+    # Peer servers contribute their own models, namespaced by their prefix,
+    # so every model across groq/opencode/openrouter is selectable by name.
+    for base, info in peer_models().items():
+        owner = info["prefix"].rstrip("/") or base
+        data += [{"id": m, "object": "model", "owned_by": owner,
+                  "context_window": 32768} for m in info.get("models", [])]
     return {"object": "list", "data": data}
 
 
@@ -685,40 +759,23 @@ async def v1_chat_completions(req: dict, http_request: _SSRequest = None):
     prompt = user_text
     if system_text:
         prompt = f"{system_text}\n\n{user_text}"
-    # Honour the model the caller actually asked for. Previously this was
-    # hardcoded to the Groq primary, so requesting an OpenRouter free model
-    # silently got Groq instead.
+    # Honour the model the caller actually asked for.
     want = model
     result = None
     served_by = "llm"
 
-    if want.endswith(":free") and ORA is not None:
-        # Explicit free-OpenRouter request
-        try:
-            ans, used = ORA.chat(prompt, model=want)
-            if ans:
-                result, served_by = ans, f"openrouter-free:{used}"
-        except Exception:
-            pass
-    elif want in ALLOWED_MODELS:
+    if want in ALLOWED_MODELS:
         result = call_groq(prompt, want)
         served_by = f"groq:{want}"
 
-    if result is None and ORA is not None and not want.endswith(":free"):
-        # Second source: free OpenRouter. Independent of every Groq key, so a
-        # Groq rate-limit can no longer stall the server.
-        try:
-            ans, used = ORA.chat(prompt)
-            if ans:
-                result, served_by = ans, f"openrouter-free:{used}"
-        except Exception:
-            pass
+    peer = peer_for(want)
+    if result is None and peer:
+        # Isolated server (OpenCode :8086 / OpenRouter :8085). HTTP only —
+        # their code never runs inside this process.
+        result = call_peer(peer, want, prompt)
+        served_by = f"openrouter-free:{want}" if peer == PEER_OPENROUTER else want
 
-    if result is None and want.startswith("opencode/"):
-        result = call_provider(user_text, want)
-        served_by = "provider-console"
-
-    if result is None and not want.endswith(":free"):
+    if result is None and peer is None:
         result = call_groq(prompt, WARM_MODELS["primary"])
         served_by = f"groq:{WARM_MODELS['primary']}"
 
@@ -958,19 +1015,18 @@ async def whoami(request: _SSRequest):
     return JSONResponse({"error": "not authenticated"}, status_code=401)
 
 
-@app.get("/openrouter/stats")
-async def openrouter_stats():
-    """Free OpenRouter models available as a second source."""
-    if ORA is None:
-        return JSONResponse({"status": "adapter_disabled"}, status_code=503)
-    return JSONResponse({"status": "ok", **ORA.health()})
 
-
-@app.post("/openrouter/refresh")
-async def openrouter_refresh():
-    if ORA is None:
-        return JSONResponse({"status": "adapter_disabled"}, status_code=503)
-    return JSONResponse({"status": "ok", "free_models": ORA.fetch_free_models(force=True)})
+@app.get("/peers")
+async def peers(force: bool = False):
+    """Which isolated provider servers are reachable, and what they serve."""
+    info = peer_models(force=force)
+    return JSONResponse({
+        "status": "ok",
+        "peers": [{"url": base, "namespace": d["prefix"], "up": d["up"],
+                   "models": len(d.get("models", [])),
+                   "error": d.get("error", "")} for base, d in info.items()],
+        "local": {"models": len(ALLOWED_MODELS) + 1, "owner": "groq/local"},
+    })
 
 
 if __name__ == "__main__":
