@@ -929,6 +929,61 @@ except Exception as _e:
     print(f"[SECURITY] middleware unavailable: {_e}")
 
 
+# ── Live .env reload ────────────────────────────────────────────────
+# Config was read once at import, so edits to .env had no effect until a
+# restart. That caused real confusion: new client keys looked "rejected" and
+# SS_HOST edits looked like no-ops. Reload before each request so the file is
+# the single source of truth. Cheap: a few stat() calls, only when changed.
+_DOTENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+_dotenv_stamp: Optional[tuple] = None
+
+
+def _load_dotenv(force: bool = False) -> bool:
+    """(Re)load .env into os.environ if the file changed. Returns True if applied."""
+    global _dotenv_stamp
+    try:
+        st = os.stat(_DOTENV_PATH)
+        stamp = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return False
+    if not force and stamp == _dotenv_stamp:
+        return False
+    applied = 0
+    try:
+        with open(_DOTENV_PATH, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip().strip('"').strip("'")
+                # Do not clobber an explicit OS-level override
+                if k and k not in os.environ:
+                    os.environ[k] = v
+                    applied += 1
+                elif k and os.environ.get(k) != v:
+                    os.environ[k] = v
+                    applied += 1
+    except OSError:
+        return False
+    _dotenv_stamp = stamp
+    # ACCESS caches the client list at construction; rebuild it so new
+    # keys take effect without a restart.
+    global ACCESS
+    if ACCESS is not None:
+        try:
+            ACCESS.reload()
+        except Exception:
+            pass
+    return True
+
+
+@app.middleware("http")
+async def _dotenv_middleware(request: _SSRequest, call_next):
+    _load_dotenv()
+    return await call_next(request)
+
 @app.middleware("http")
 async def _security_middleware(request: _SSRequest, call_next):
     """Applies security headers to everything, and refuses oversized bodies."""

@@ -91,7 +91,11 @@ const logBox=$('log');
 function log(html){const d=document.createElement('div');d.className='line';d.innerHTML=html;logBox.appendChild(d);logBox.scrollTop=logBox.scrollHeight}
 const esc=s=>String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 
-async function j(u,o){try{const r=await fetch(u,o);return await r.json()}catch(e){return{_err:e.message}}}
+async function j(u,o){
+  // credentials:'same-origin' makes fetch send the session cookie.
+  // Without it every chat call 401s in a browser even after login.
+  try{const r=await fetch(u,{credentials:'same-origin',...(o||{})});return await r.json()}
+  catch(e){return{_err:e.message}}}
 function rows(el,d){
   const h=Object.entries(d).map(([k,v])=>{
     let val = v===true?'<span class="dot ok"></span>yes':v===false?'<span class="dot bad"></span>no':esc(v);
