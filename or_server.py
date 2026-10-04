@@ -53,7 +53,7 @@ _lock = threading.Lock()
 _key_cache: Optional[str] = None
 _model_cache: List[str] = []
 _model_fetched: float = 0.0
-_stats = {"requests": 0, "served": 0, "failed": 0, "by_model": {}}
+_stats = {"requests": 0, "served": 0, "failed": 0, "throttled": 0, "by_model": {}}
 
 # Live sweep 2026-10-04: 12 of 17 free models answered correctly.
 VERIFIED = [
@@ -130,6 +130,66 @@ def pick(task: str = "") -> str:
     return free[0] if free else VERIFIED[0]
 
 
+def _ordered_candidates(requested: str, prompt: str, limit: int = 5) -> List[str]:
+    """Requested model first, then a preference list of free models.
+
+    Deduplicated, verified-only, capped. Used when a 429 tells us the
+    requested pick is throttled right now.
+    """
+    ordered: List[str] = []
+    if requested:
+        ordered.append(requested)
+    first = pick(prompt)
+    if first:
+        ordered.append(first)
+    for m in VERIFIED:
+        ordered.append(m)
+    seen = set()
+    out = []
+    for m in ordered:
+        if m and m not in seen:
+            seen.add(m)
+            out.append(m)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _one_call(k: str, mdl: str, messages: List[Dict], max_tokens: int
+              ) -> Tuple[Optional[str], Optional[str]]:
+    """Single attempt. Returns (text, error). error 'throttled' marks a 429."""
+    try:
+        import requests
+        r = requests.post(
+            CHAT_URL,
+            headers={"Authorization": f"Bearer {k}",
+                     "Content-Type": "application/json",
+                     "HTTP-Referer": "http://127.0.0.1:8082",
+                     "X-Title": "Super-Soldier-OpenRouter"},
+            json={"model": mdl, "messages": messages,
+                  "max_tokens": max_tokens, "temperature": 0.3},
+            timeout=TIMEOUT)
+        if r.status_code == 429:
+            return None, "throttled"
+        if r.status_code != 200:
+            # 401/403 means the credential is the problem - retrying other
+            # models cannot help, so surface it immediately.
+            return None, f"http {r.status_code}"
+        payload = r.json()
+        ch = payload.get("choices") or []
+        if not ch:
+            return None, "no choices"
+        msg = ch[0].get("message") or {}
+        # Reasoning models can return content=None when the whole budget went
+        # to `reasoning`. Use that rather than returning nothing.
+        text = (msg.get("content") or msg.get("reasoning") or "").strip()
+        if not text:
+            return None, "empty completion"
+        return text, None
+    except Exception as e:
+        return None, type(e).__name__
+
+
 def complete(messages: List[Dict], model: str = "", max_tokens: int = 2048
              ) -> Tuple[Optional[str], str, Optional[str]]:
     """Returns (content, model_used, error)."""
@@ -138,38 +198,31 @@ def complete(messages: List[Dict], model: str = "", max_tokens: int = 2048
         return None, "", "no OR_API_KEY and no fallback credential"
     prompt = "\n".join(m.get("content") or "" for m in messages
                        if m.get("role") in ("user", "system", "assistant"))
-    mdl = model or pick(prompt)
-    try:
-        import requests
-        r = requests.post(
-            CHAT_URL,
-            headers={"Authorization": f"Bearer {k}",
-                     "Content-Type": "application/json",
-                     "HTTP-Referer": "http://localhost:8082",
-                     "X-Title": "Super-Soldier-OpenRouter"},
-            json={"model": mdl, "messages": messages,
-                  "max_tokens": max_tokens, "temperature": 0.3},
-            timeout=TIMEOUT)
-        if r.status_code != 200:
-            return None, mdl, f"http {r.status_code}"
-        payload = r.json()
-        ch = payload.get("choices") or []
-        if not ch:
-            return None, mdl, "no choices"
-        msg = ch[0].get("message") or {}
-        # Reasoning models can return content=None when the budget went to
-        # `reasoning`. Use it rather than returning nothing.
-        text = (msg.get("content") or msg.get("reasoning") or "").strip()
-        if not text:
-            return None, mdl, "empty completion"
-        with _lock:
-            _stats["served"] += 1
-            _stats["by_model"][mdl] = _stats["by_model"].get(mdl, 0) + 1
-        return text, mdl, None
-    except Exception as e:
-        with _lock:
-            _stats["failed"] += 1
-        return None, mdl, type(e).__name__
+
+    candidates = _ordered_candidates(model, prompt)
+    last_err = "no candidates"
+    used = candidates[0] if candidates else ""
+    for mdl in candidates:
+        text, err = _one_call(k, mdl, messages, max_tokens)
+        if text:
+            with _lock:
+                _stats["served"] += 1
+                _stats["by_model"][mdl] = _stats["by_model"].get(mdl, 0) + 1
+            return text, mdl, None
+        used = mdl
+        last_err = err or "unknown"
+        if err == "throttled":
+            # This model is busy - move to the next one.
+            with _lock:
+                _stats["throttled"] = _stats.get("throttled", 0) + 1
+            continue
+        # Anything else (401, malformed, timeout) is not fixed by switching
+        # models, so stop here rather than hammering the API.
+        break
+
+    with _lock:
+        _stats["failed"] += 1
+    return None, used, last_err
 
 
 # ── tiny HTTP layer (no framework: keeps this server dependency-free) ──
