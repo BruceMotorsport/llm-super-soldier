@@ -725,7 +725,15 @@ async def v1_chat_completions(req: dict, http_request: _SSRequest = None):
     messages = req.get("messages", [])
     temperature = req.get("temperature", 0.1)
     max_tokens = req.get("max_tokens", 2048)
-    _client = ACCESS.authenticate(_client_key(http_request)).client if ACCESS else "open"
+    if ACCESS is None:
+        _client = "open"
+    else:
+        _k = _client_key(http_request) if http_request is not None else ""
+        if _k:
+            _client = ACCESS.authenticate(_k).client
+        else:
+            _client = (verify_session(http_request.cookies.get(COOKIE, ""))
+                       if http_request is not None else None) or "session"
 
     # Split system messages out — the ladder/persona owns identity, not the client
     system_text = "\n".join(m["content"] for m in messages if m.get("role") == "system")
@@ -823,15 +831,34 @@ def _client_key(req: _SSRequest) -> str:
 
 
 async def _guard(req: _SSRequest, path: str, model: str = ""):
-    """Returns (ok, status_code, body). Never raises — auth must not 500."""
+    """Returns (ok, status_code, body). Never raises — auth must not 500.
+
+    Accepts EITHER a client key (Authorization / x-api-key) OR a valid
+    signed session cookie. The console logs in with a cookie, so key-only
+    auth here made every chat call 401 while /ui itself loaded fine.
+    """
     if ACCESS is None:
         return True, 200, None
-    key = _client_key(req)
-    res = ACCESS.authenticate(key)
-    if not res.ok:
-        return False, 401, {"error": {"message": res.reason,
-                                      "type": "auth_error"}}
-    ok, retry = ACCESS.check_rate(res.client)
+    if not ACCESS.auth_required:
+        return True, 200, None
+
+    client = "anonymous"
+    key = _client_key(req) if req is not None else ""
+    if key:
+        res = ACCESS.authenticate(key)
+        if not res.ok:
+            return False, 401, {"error": {"message": res.reason,
+                                          "type": "auth_error"}}
+        client = res.client
+    else:
+        # No key supplied — fall back to the browser session cookie.
+        user = verify_session(req.cookies.get(COOKIE, "")) if req is not None else None
+        if not user:
+            return False, 401, {"error": {"message": "missing api key",
+                                          "type": "auth_error"}}
+        client = user
+
+    ok, retry = ACCESS.check_rate(client)
     if not ok:
         return False, 429, {"error": {"message":
                                       f"rate limit: {RATE_LIMIT_HINT}/min",
